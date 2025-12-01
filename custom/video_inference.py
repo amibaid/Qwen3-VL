@@ -324,11 +324,20 @@ def evaluate_from_json(
         torch.cuda.synchronize()
         t_infer_start = time.perf_counter()
 
+        if len(timestamps) > 1:
+            t0 = float(timestamps[0, 1])
+            t1 = float(timestamps[-1, 1])
+            duration = max(t1 - t0, 1e-6)
+            effective_sample_fps = len(frames_np) / duration
+        else:
+            effective_sample_fps = 1.0
+
+
         # Call your existing inference() function
         model_output = inference(
             frames_pil,
             prompt,
-            sample_fps=sample_fps,
+            sample_fps=effective_sample_fps,
             total_pixels=total_pixels,
             max_new_tokens=max_new_tokens,
         )
@@ -394,9 +403,9 @@ def main():
         json_path=JSON_PATH,
         video_dir=VIDEO_DIR,
         csv_filter_path=CSV_PATH,
-        num_frames=8,
+        num_frames=4,
         sample_fps=0.25,
-        total_pixels=3 * 384 * 384,
+        total_pixels=4 * 256 * 256,
         max_new_tokens=16,
     )
 
