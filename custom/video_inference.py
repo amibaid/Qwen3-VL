@@ -4,20 +4,23 @@ import math
 import hashlib
 import requests
 import sys
+import json
+import csv
+import re
+import torch
+from typing import Optional, List, Dict, Any, Set
 
-sys.path.append('/content/drive/MyDrive/Qwen3-VL/qwen-vl-utils/src/')
+sys.path.append('/content/drive/MyDrive/381V-final-project/Qwen3-VL/qwen-vl-utils/src/')
 
 from IPython.display import Markdown, display
 import numpy as np
 from PIL import Image
 import decord
 from decord import VideoReader, cpu
-
 from transformers import AutoProcessor, AutoModelForVision2Seq
 from qwen_vl_utils import process_vision_info
 import warnings
 warnings.filterwarnings("ignore", category=FutureWarning, module="transformers")
-
 
 
 model_path = "Qwen/Qwen3-VL-8B-Instruct"
@@ -25,6 +28,77 @@ processor = AutoProcessor.from_pretrained(model_path)
 
 model, output_loading_info = AutoModelForVision2Seq.from_pretrained(model_path, torch_dtype="auto", device_map="auto", output_loading_info=True)
 print("output_loading_info", output_loading_info)
+
+
+def load_video_id_filter(csv_path: Optional[str]) -> Optional[Set[str]]:
+    """
+    Load a set of video IDs (e.g. P01-20240203-123350) from a CSV file.
+    Assumes either:
+      - A single column with or without header, or
+      - A column named 'video_id'.
+    """
+    if csv_path is None:
+        return None
+
+    video_ids = set()
+    with open(csv_path, 'r', newline='') as f:
+        reader = csv.reader(f)
+        rows = list(reader)
+
+    # Empty file
+    if not rows:
+        return set()
+
+    # Try to detect header
+    header = rows[0]
+    if len(header) == 1 and header[0].lower() in {"video_id", "id"}:
+        # Skip header row
+        for row in rows[1:]:
+            if row and row[0].strip():
+                video_ids.add(row[0].strip())
+    else:
+        # Treat all non-empty entries as IDs
+        for row in rows:
+            if not row:
+                continue
+            if row[0].strip():
+                video_ids.add(row[0].strip())
+
+    return video_ids
+
+
+def build_mcq_prompt(question: str, choices: List[str]) -> str:
+    """
+    Build a multiple-choice prompt. The model is asked to output ONLY
+    the index of the correct choice (0, 1, 2, ...).
+    """
+    choices_text = "\n".join(f"{i}. {c}" for i, c in enumerate(choices))
+    prompt = f"""You are given a video segment and a multiple-choice question about it.
+
+    Question:
+    {question}
+
+    Choices:
+    {choices_text}
+
+    Respond with the index of the correct choice (0-{len(choices) - 1}) ONLY.
+    Do not output any words or explanation, just a single integer."""
+    return prompt
+
+def parse_predicted_index(model_output: str, num_choices: int) -> Optional[int]:
+    """
+    Parse the model's output as an integer index in [0, num_choices-1].
+    Returns None if parsing fails.
+    """
+    text = model_output.strip()
+    # Grab first integer that appears
+    m = re.search(r"\d+", text)
+    if not m:
+        return None
+    idx = int(m.group(0))
+    if 0 <= idx < num_choices:
+        return idx
+    return None
 
 
 def download_video(url, dest_path):
@@ -137,16 +211,153 @@ def inference(video, prompt, max_new_tokens=2048, total_pixels=20480 * 32 * 32, 
     output_text = processor.batch_decode(generated_ids, skip_special_tokens=True, clean_up_tokenization_spaces=True)
     return output_text[0]
 
-VIDEO = "/content/drive/MyDrive/Qwen3-VL/_ghcXIz_m6o_080000_090000.mp4"
 
-video_path, frames_np, timestamps = get_video_frames(VIDEO, num_frames=12, cache_dir=".cache")
+def evaluate_from_json(
+    json_path: str,
+    video_dir: str,
+    csv_filter_path: Optional[str] = None,
+    num_frames: int = 12,
+    sample_fps: float = 0.25,
+    total_pixels: int = 24 * 1024 * 32 * 32,
+    max_new_tokens: int = 256,
+  ) -> Dict[str, Any]:
+    """
+    Evaluate Qwen3-VL on a JSON dataset of video multiple-choice questions.
 
-# grid = create_image_grid(frames_np, num_columns=6)
+    Args:
+        json_path: Path to the JSON file with structure like in the example.
+        video_dir: Directory that contains per-question video clips, named like
+                  <q_key>.mp4 (e.g. fine_grained_action_localization_0.mp4).
+        csv_filter_path: Optional path to CSV with allowed video IDs. If given,
+                        only questions whose q_data.inputs["video 1"]["id"]
+                        is in this CSV will be evaluated.
+        num_frames: Number of frames to sample per video.
+        sample_fps: Sampling FPS passed to the model when using frame lists.
+        total_pixels: total_pixels argument forwarded to inference().
+        max_new_tokens: max_new_tokens argument forwarded to inference().
 
-frames_pil = [Image.fromarray(arr) for arr in frames_np]
+    Returns:
+        A dict with overall accuracy and per-question details.
+    """
+    # Load JSON
+    with open(json_path, "r") as f:
+        data = json.load(f)
 
-prompt = "Briefly describe the video."
-response = inference(frames_pil, prompt, sample_fps=0.25, total_pixels=24*1024*32*32)
+    questions = data.get("questions", [])
+    video_id_filter = load_video_id_filter(csv_filter_path)
 
-print(response)
+    results = []
+    n_total = 0
+    n_correct = 0
+
+    for q in questions:
+        q_key = q["q_key"]                      # e.g. 'fine_grained_action_localization_0'
+        q_data = q["q_data"]
+        q_inputs = q_data["inputs"]["video 1"]
+        video_id = q_inputs["id"]              # e.g. 'P01-20240203-123350'
+        question_text = q_data["question"]
+        choices = q_data["choices"]
+        correct_idx = q_data["correct_idx"]
+
+        # Filter by CSV video IDs if provided
+        if video_id_filter is not None and video_id not in video_id_filter:
+            continue
+
+        # Build path to video file: <video_dir>/<q_key>.mp4
+        video_filename = f"{q_key}.mp4"
+        video_path = os.path.join(video_dir, video_filename)
+
+        if not os.path.exists(video_path):
+            print(f"[WARN] Video file not found for {q_key}: {video_path}, skipping.")
+            continue
+
+        # Sample frames from the video
+        try:
+            _, frames_np, timestamps = get_video_frames(
+                video_path,
+                num_frames=num_frames,
+                cache_dir=".cache"
+            )
+        except Exception as e:
+            print(f"[ERROR] Failed to read video {video_path}: {e}")
+            continue
+
+        frames_pil = [Image.fromarray(arr) for arr in frames_np]
+
+        # Build MCQ prompt
+        prompt = build_mcq_prompt(question_text, choices)
+
+        # Call your existing inference() function
+        model_output = inference(
+            frames_pil,
+            prompt,
+            sample_fps=sample_fps,
+            total_pixels=total_pixels,
+            max_new_tokens=max_new_tokens,
+        )
+
+        pred_idx = parse_predicted_index(model_output, len(choices))
+
+        is_correct = (pred_idx == correct_idx)
+        if pred_idx is not None:
+            n_total += 1
+            if is_correct:
+                n_correct += 1
+
+        results.append({
+            "q_key": q_key,
+            "video_id": video_id,
+            "video_path": video_path,
+            "question": question_text,
+            "choices": choices,
+            "correct_idx": correct_idx,
+            "model_output_raw": model_output,
+            "pred_idx": pred_idx,
+            "is_correct": is_correct,
+        })
+
+        print(
+            f"Q: {q_key}  |  video_id={video_id}  |  "
+            f"pred={pred_idx}  |  gold={correct_idx}  |  correct={is_correct}"
+        )
+
+    accuracy = (n_correct / n_total) if n_total > 0 else 0.0
+    print("\n=== Evaluation summary ===")
+    print(f"Evaluated examples: {n_total}")
+    print(f"Correct: {n_correct}")
+    print(f"Accuracy: {accuracy:.4f}")
+
+    return {
+        "accuracy": accuracy,
+        "n_total": n_total,
+        "n_correct": n_correct,
+        "results": results,
+    }
+
+
+def main():
+    JSON_PATH = "/content/drive/MyDrive/381V-final-project/HD-EPIC/test_vqa.json"
+    VIDEO_DIR = "/content/drive/MyDrive/381V final project/eval data/trimmed_clips"
+
+    # If you don't want filtering, set CSV_PATH = None
+    CSV_PATH = None
+
+    eval_stats = evaluate_from_json(
+        json_path=JSON_PATH,
+        video_dir=VIDEO_DIR,
+        csv_filter_path=CSV_PATH,
+        num_frames=12,
+        sample_fps=0.25,
+        total_pixels=24 * 1024 * 32 * 32,
+        max_new_tokens=256,
+    )
+
+if __name__ == "__main__":
+    main()
+
+
+
+
+
+
 
