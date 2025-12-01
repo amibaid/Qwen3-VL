@@ -8,6 +8,7 @@ import json
 import csv
 import re
 import torch
+import time
 from typing import Optional, List, Dict, Any, Set
 
 sys.path.append('/content/drive/MyDrive/381V-final-project/Qwen3-VL/qwen-vl-utils/src/')
@@ -23,12 +24,25 @@ import warnings
 warnings.filterwarnings("ignore", category=FutureWarning, module="transformers")
 
 
-model_path = "Qwen/Qwen3-VL-8B-Instruct"
+model_path = "Qwen/Qwen3-VL-4B-Instruct"
 processor = AutoProcessor.from_pretrained(model_path)
 
-model, output_loading_info = AutoModelForVision2Seq.from_pretrained(model_path, torch_dtype="auto", device_map="auto", output_loading_info=True)
+model, output_loading_info = AutoModelForVision2Seq.from_pretrained(model_path,
+    torch_dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16,
+    output_loading_info=True,
+    attn_implementation="sdpa",
+    device_map={"": "cuda"})
 print("output_loading_info", output_loading_info)
 
+print(model.hf_device_map)
+for name, p in model.named_parameters():
+    if p.device.type != "cuda":
+        print("ON CPU:", name, p.device)
+model.eval()
+torch.set_grad_enabled(False)
+
+print("CUDA available:", torch.cuda.is_available())
+print("First param device:", next(model.parameters()).device)
 
 def load_video_id_filter(csv_path: Optional[str]) -> Optional[Set[str]]:
     """
@@ -182,7 +196,7 @@ def inference(video, prompt, max_new_tokens=2048, total_pixels=20480 * 32 * 32, 
         - When `video` is a string (path/URL), `sample_fps` is ignored and will be overridden by the video reader backend.
         - When `video` is a frame list, `sample_fps` informs the model of the original sampling rate to help understand temporal density.
     """
-
+    print(time.time(), "starting inference")
     messages = [
         {"role": "user", "content": [
                 {"video": video,
@@ -198,6 +212,7 @@ def inference(video, prompt, max_new_tokens=2048, total_pixels=20480 * 32 * 32, 
     image_inputs, video_inputs, video_kwargs = process_vision_info([messages], return_video_kwargs=True,
                                                                    image_patch_size= 16,
                                                                    return_video_metadata=True)
+    print(time.time(), "processed vision info")
     if video_inputs is not None:
         video_inputs, video_metadatas = zip(*video_inputs)
         video_inputs, video_metadatas = list(video_inputs), list(video_metadatas)
@@ -205,10 +220,25 @@ def inference(video, prompt, max_new_tokens=2048, total_pixels=20480 * 32 * 32, 
         video_metadatas = None
     inputs = processor(text=[text], images=image_inputs, videos=video_inputs, video_metadata=video_metadatas, **video_kwargs, do_resize=False, return_tensors="pt")
     inputs = inputs.to('cuda')
+    print(time.time(), "put inputs on device")
+    print("input_ids shape:", inputs["input_ids"].shape)
+    print("total tokens:", inputs["input_ids"].numel())
+    print("max_new_tokens", max_new_tokens)
 
-    output_ids = model.generate(**inputs, max_new_tokens=max_new_tokens)
+    with torch.inference_mode():
+        # output_ids = model.generate(**inputs, max_new_tokens=max_new_tokens)
+        output_ids = model.generate(
+          **inputs,
+          max_new_tokens=max_new_tokens,  # actually 16 🙂
+          do_sample=False,
+          num_beams=1,
+          use_cache=True,
+        )
+    print(time.time(), "did generation")
+
     generated_ids = [output_ids[len(input_ids):] for input_ids, output_ids in zip(inputs.input_ids, output_ids)]
     output_text = processor.batch_decode(generated_ids, skip_special_tokens=True, clean_up_tokenization_spaces=True)
+    print(time.time(), "finished function")
     return output_text[0]
 
 
@@ -251,6 +281,8 @@ def evaluate_from_json(
     n_correct = 0
 
     for q in questions:
+        t_q_start = time.perf_counter()
+
         q_key = q["q_key"]                      # e.g. 'fine_grained_action_localization_0'
         q_data = q["q_data"]
         q_inputs = q_data["inputs"]["video 1"]
@@ -272,20 +304,25 @@ def evaluate_from_json(
             continue
 
         # Sample frames from the video
+        t_frames_start = time.perf_counter()
         try:
             _, frames_np, timestamps = get_video_frames(
                 video_path,
                 num_frames=num_frames,
-                cache_dir=".cache"
+                cache_dir=".cache",
             )
         except Exception as e:
             print(f"[ERROR] Failed to read video {video_path}: {e}")
             continue
+        t_frames_end = time.perf_counter()
 
         frames_pil = [Image.fromarray(arr) for arr in frames_np]
 
         # Build MCQ prompt
         prompt = build_mcq_prompt(question_text, choices)
+
+        torch.cuda.synchronize()
+        t_infer_start = time.perf_counter()
 
         # Call your existing inference() function
         model_output = inference(
@@ -294,6 +331,18 @@ def evaluate_from_json(
             sample_fps=sample_fps,
             total_pixels=total_pixels,
             max_new_tokens=max_new_tokens,
+        )
+
+        torch.cuda.synchronize()
+        t_infer_end = time.perf_counter()
+        
+        t_q_end = time.perf_counter()
+
+        print(
+            f"Q: {q_key} | "
+            f"frames={t_frames_end - t_frames_start:.3f}s | "
+            f"infer={t_infer_end - t_infer_start:.3f}s | "
+            f"total={t_q_end - t_q_start:.3f}s"
         )
 
         pred_idx = parse_predicted_index(model_output, len(choices))
@@ -334,7 +383,6 @@ def evaluate_from_json(
         "results": results,
     }
 
-
 def main():
     JSON_PATH = "/content/drive/MyDrive/381V-final-project/HD-EPIC/test_vqa.json"
     VIDEO_DIR = "/content/drive/MyDrive/381V final project/eval data/trimmed_clips"
@@ -346,18 +394,13 @@ def main():
         json_path=JSON_PATH,
         video_dir=VIDEO_DIR,
         csv_filter_path=CSV_PATH,
-        num_frames=12,
+        num_frames=8,
         sample_fps=0.25,
-        total_pixels=24 * 1024 * 32 * 32,
-        max_new_tokens=256,
+        total_pixels=3 * 384 * 384,
+        max_new_tokens=16,
     )
 
 if __name__ == "__main__":
     main()
-
-
-
-
-
 
 
