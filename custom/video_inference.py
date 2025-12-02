@@ -9,6 +9,7 @@ import csv
 import re
 import torch
 import time
+from tqdm.auto import tqdm
 from typing import Optional, List, Dict, Any, Set
 
 sys.path.append('/content/drive/MyDrive/381V-final-project/Qwen3-VL/qwen-vl-utils/src/')
@@ -45,38 +46,27 @@ print("CUDA available:", torch.cuda.is_available())
 print("First param device:", next(model.parameters()).device)
 
 def load_video_id_filter(csv_path: Optional[str]) -> Optional[Set[str]]:
-    """
-    Load a set of video IDs (e.g. P01-20240203-123350) from a CSV file.
-    Assumes either:
-      - A single column with or without header, or
-      - A column named 'video_id'.
-    """
     if csv_path is None:
         return None
 
-    video_ids = set()
-    with open(csv_path, 'r', newline='') as f:
-        reader = csv.reader(f)
-        rows = list(reader)
+    video_ids: Set[str] = set()
 
-    # Empty file
-    if not rows:
-        return set()
+    with open(csv_path, "r", newline="") as f:
+        reader = csv.DictReader(f)
+        if not reader.fieldnames:
+            raise ValueError("CSV file has no header row.")
 
-    # Try to detect header
-    header = rows[0]
-    if len(header) == 1 and header[0].lower() in {"video_id", "id"}:
-        # Skip header row
-        for row in rows[1:]:
-            if row and row[0].strip():
-                video_ids.add(row[0].strip())
-    else:
-        # Treat all non-empty entries as IDs
-        for row in rows:
-            if not row:
-                continue
-            if row[0].strip():
-                video_ids.add(row[0].strip())
+        # Find the 'video_id' column (case-insensitive)
+        lower_to_original = {name.lower(): name for name in reader.fieldnames}
+        if "video_id" not in lower_to_original:
+            raise ValueError("CSV must contain a 'video_id' column.")
+
+        video_id_col = lower_to_original["video_id"]
+
+        for row in reader:
+            val = (row.get(video_id_col) or "").strip()
+            if val:
+                video_ids.add(val)
 
     return video_ids
 
@@ -196,7 +186,7 @@ def inference(video, prompt, max_new_tokens=2048, total_pixels=20480 * 32 * 32, 
         - When `video` is a string (path/URL), `sample_fps` is ignored and will be overridden by the video reader backend.
         - When `video` is a frame list, `sample_fps` informs the model of the original sampling rate to help understand temporal density.
     """
-    print(time.time(), "starting inference")
+
     messages = [
         {"role": "user", "content": [
                 {"video": video,
@@ -212,7 +202,7 @@ def inference(video, prompt, max_new_tokens=2048, total_pixels=20480 * 32 * 32, 
     image_inputs, video_inputs, video_kwargs = process_vision_info([messages], return_video_kwargs=True,
                                                                    image_patch_size= 16,
                                                                    return_video_metadata=True)
-    print(time.time(), "processed vision info")
+
     if video_inputs is not None:
         video_inputs, video_metadatas = zip(*video_inputs)
         video_inputs, video_metadatas = list(video_inputs), list(video_metadatas)
@@ -220,26 +210,28 @@ def inference(video, prompt, max_new_tokens=2048, total_pixels=20480 * 32 * 32, 
         video_metadatas = None
     inputs = processor(text=[text], images=image_inputs, videos=video_inputs, video_metadata=video_metadatas, **video_kwargs, do_resize=False, return_tensors="pt")
     inputs = inputs.to('cuda')
-    print(time.time(), "put inputs on device")
-    print("input_ids shape:", inputs["input_ids"].shape)
-    print("total tokens:", inputs["input_ids"].numel())
-    print("max_new_tokens", max_new_tokens)
+
+    input_token_count = int(inputs["input_ids"].shape[1])
 
     with torch.inference_mode():
         # output_ids = model.generate(**inputs, max_new_tokens=max_new_tokens)
         output_ids = model.generate(
           **inputs,
-          max_new_tokens=max_new_tokens,  # actually 16 🙂
+          max_new_tokens=max_new_tokens,
           do_sample=False,
           num_beams=1,
           use_cache=True,
         )
-    print(time.time(), "did generation")
 
     generated_ids = [output_ids[len(input_ids):] for input_ids, output_ids in zip(inputs.input_ids, output_ids)]
+    output_token_count = int(generated_ids[0].shape[0])
     output_text = processor.batch_decode(generated_ids, skip_special_tokens=True, clean_up_tokenization_spaces=True)
-    print(time.time(), "finished function")
-    return output_text[0]
+
+    stats = {
+            "input_tokens": input_token_count,
+            "output_tokens": output_token_count,
+        }
+    return output_text[0], stats
 
 
 def evaluate_from_json(
@@ -250,6 +242,10 @@ def evaluate_from_json(
     sample_fps: float = 0.25,
     total_pixels: int = 24 * 1024 * 32 * 32,
     max_new_tokens: int = 256,
+    num_shards: int = 1,
+    shard_id: int = 0,
+    use_tqdm: bool = True,
+    results_csv_path: Optional[str] = None,
   ) -> Dict[str, Any]:
     """
     Evaluate Qwen3-VL on a JSON dataset of video multiple-choice questions.
@@ -276,11 +272,59 @@ def evaluate_from_json(
     questions = data.get("questions", [])
     video_id_filter = load_video_id_filter(csv_filter_path)
 
+    if video_id_filter is not None:
+        questions = [
+            q for q in questions
+            if q["q_data"]["inputs"]["video 1"]["id"] in video_id_filter
+        ]
+
+    shard_indices = [
+        i for i in range(len(questions))
+        if (num_shards == 1) or (i % num_shards == shard_id)
+    ]
+
+    base_iterable = ((i, questions[i]) for i in shard_indices)
+
+    if use_tqdm:
+        iterable = tqdm(
+            base_iterable,
+            total=len(shard_indices),
+            desc=f"Evaluating shard {shard_id}/{num_shards}",
+        )
+    else:
+        iterable = base_iterable
+
     results = []
     n_total = 0
     n_correct = 0
 
-    for q in questions:
+    csv_file = None
+    csv_writer = None
+    if results_csv_path is not None:
+        file_exists = os.path.exists(results_csv_path)
+        csv_file = open(results_csv_path, "a", newline="")
+        fieldnames = [
+            "question_id",
+            "video_id",
+            "video_path",
+            "correct_idx",
+            "pred_idx",
+            "is_correct",
+            "response",
+            "num_frames",
+            "frame_height",
+            "frame_width",
+            "total_pixels",         # H * W * num_frames
+            "requested_pixels",    # the total_pixels budget passed into inference
+            "input_tokens",
+            "output_tokens",
+            "sample_fps_eff",
+        ]
+        csv_writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
+        if not file_exists:
+            csv_writer.writeheader()
+
+    for idx, q in iterable:
         t_q_start = time.perf_counter()
 
         q_key = q["q_key"]                      # e.g. 'fine_grained_action_localization_0'
@@ -318,11 +362,14 @@ def evaluate_from_json(
 
         frames_pil = [Image.fromarray(arr) for arr in frames_np]
 
+        # some basic stats
+        num_frames_used = frames_np.shape[0]
+        frame_height = frames_np.shape[1]
+        frame_width = frames_np.shape[2]
+        pixels_used = int(num_frames_used * frame_height * frame_width)
+
         # Build MCQ prompt
         prompt = build_mcq_prompt(question_text, choices)
-
-        torch.cuda.synchronize()
-        t_infer_start = time.perf_counter()
 
         if len(timestamps) > 1:
             t0 = float(timestamps[0, 1])
@@ -334,24 +381,12 @@ def evaluate_from_json(
 
 
         # Call your existing inference() function
-        model_output = inference(
+        model_output, infer_stats = inference(
             frames_pil,
             prompt,
             sample_fps=effective_sample_fps,
             total_pixels=total_pixels,
             max_new_tokens=max_new_tokens,
-        )
-
-        torch.cuda.synchronize()
-        t_infer_end = time.perf_counter()
-        
-        t_q_end = time.perf_counter()
-
-        print(
-            f"Q: {q_key} | "
-            f"frames={t_frames_end - t_frames_start:.3f}s | "
-            f"infer={t_infer_end - t_infer_start:.3f}s | "
-            f"total={t_q_end - t_q_start:.3f}s"
         )
 
         pred_idx = parse_predicted_index(model_output, len(choices))
@@ -361,23 +396,35 @@ def evaluate_from_json(
             n_total += 1
             if is_correct:
                 n_correct += 1
-
-        results.append({
-            "q_key": q_key,
+        
+        result_row = {
+            "question_id": q_key,  # alias, in case you prefer this name
             "video_id": video_id,
             "video_path": video_path,
-            "question": question_text,
-            "choices": choices,
             "correct_idx": correct_idx,
-            "model_output_raw": model_output,
-            "pred_idx": pred_idx,
-            "is_correct": is_correct,
+            "pred_idx": pred_idx if pred_idx is not None else "",
+            "is_correct": int(is_correct) if pred_idx is not None else "",
+            "response": model_output,
+            "num_frames": num_frames_used,
+            "frame_height": frame_height,
+            "frame_width": frame_width,
+            "total_pixels": pixels_used,
+            "requested_pixels": int(total_pixels),
+            "input_tokens": infer_stats["input_tokens"],
+            "output_tokens": infer_stats["output_tokens"],
+            "sample_fps_eff": effective_sample_fps,
+        }
+
+        results.append({
+            **result_row,
         })
 
-        print(
-            f"Q: {q_key}  |  video_id={video_id}  |  "
-            f"pred={pred_idx}  |  gold={correct_idx}  |  correct={is_correct}"
-        )
+        if csv_writer is not None:
+            csv_writer.writerow(result_row)
+            csv_file.flush()
+
+    if csv_file is not None:
+        csv_file.close()
 
     accuracy = (n_correct / n_total) if n_total > 0 else 0.0
     print("\n=== Evaluation summary ===")
@@ -391,25 +438,95 @@ def evaluate_from_json(
         "n_correct": n_correct,
         "results": results,
     }
+import argparse
 
-def main():
-    JSON_PATH = "/content/drive/MyDrive/381V-final-project/HD-EPIC/test_vqa.json"
-    VIDEO_DIR = "/content/drive/MyDrive/381V final project/eval data/trimmed_clips"
 
-    # If you don't want filtering, set CSV_PATH = None
-    CSV_PATH = None
-
+def main(args):
     eval_stats = evaluate_from_json(
-        json_path=JSON_PATH,
-        video_dir=VIDEO_DIR,
-        csv_filter_path=CSV_PATH,
-        num_frames=4,
-        sample_fps=0.25,
-        total_pixels=4 * 256 * 256,
-        max_new_tokens=16,
+        json_path=args.json_path,
+        video_dir=args.video_dir,
+        csv_filter_path=args.csv_path,
+        num_frames=args.num_frames,
+        sample_fps=args.sample_fps,
+        total_pixels=args.total_pixels,
+        max_new_tokens=args.max_new_tokens,
+        num_shards=args.num_shards,
+        shard_id=args.shard_id,
+        results_csv_path=args.results_csv,
     )
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="Evaluate Qwen3-VL on video MCQ dataset")
+
+    # Paths
+    parser.add_argument(
+        "--json-path",
+        type=str,
+        default="/content/drive/MyDrive/381V-final-project/HD-EPIC/test_vqa.json",
+        help="Path to the VQA JSON file",
+    )
+    parser.add_argument(
+        "--video-dir",
+        type=str,
+        default="/content/drive/MyDrive/381V final project/eval data/trimmed_clips",
+        help="Directory containing trimmed video clips",
+    )
+    parser.add_argument(
+        "--csv-path",
+        type=str,
+        default="/content/drive/MyDrive/381V-final-project/HD-EPIC/P02_videos.csv",
+        help="Optional CSV with allowed video_ids (set to empty string to disable)",
+    )
+    parser.add_argument(
+        "--results-csv",
+        type=str,
+        default="/content/drive/MyDrive/381V-final-project/dump/qwen3_vl_results.csv",
+        help="Path to CSV file where per-question results will be appended",
+    )
+    parser.add_argument(
+        "--num-frames",
+        type=int,
+        default=4,
+        help="Number of frames to sample per video",
+    )
+    parser.add_argument(
+        "--sample-fps",
+        type=float,
+        default=0.25,
+        help="Effective sampling FPS for frame lists",
+    )
+    parser.add_argument(
+        "--total-pixels",
+        type=int,
+        default=4 * 256 * 256,
+        help="Total pixel budget passed to inference()",
+    )
+    parser.add_argument(
+        "--max-new-tokens",
+        type=int,
+        default=8,
+        help="Max new tokens for generation",
+    )
+    parser.add_argument(
+        "--num-shards",
+        type=int,
+        default=1,
+        help="Total number of shards for distributed evaluation",
+    )
+    parser.add_argument(
+        "--shard-id",
+        type=int,
+        default=0,
+        help="Shard index for this process (0-based)",
+    )
+
+    args = parser.parse_args()
+
+    # Allow disabling CSV filter by passing empty string
+    if args.csv_path == "":
+        args.csv_path = None
+
+    main(args)
+
 
 
