@@ -26,7 +26,13 @@ VIDEOCHATGPT = {
     "data_path": "PATH_TO_VIDEOCHATGPT_DATA",
 }
 
+MY_DATASET = {
+    "annotation_path": "/content/10_annotations.json",
+    "data_path": "/content/clips",
+}
+
 data_dict = {
+    "my_dataset": MY_DATASET,
     "cambrian_737k": CAMBRIAN_737K,
     "cambrian_737k_pack": CAMBRIAN_737K_PACK,
     "mp_doc": MP_DOC,

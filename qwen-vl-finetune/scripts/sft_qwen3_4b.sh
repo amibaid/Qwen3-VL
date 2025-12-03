@@ -4,6 +4,7 @@
 MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
 MASTER_PORT=${MASTER_PORT:-$(shuf -i 20001-29999 -n 1)}
 NNODES=${WORLD_SIZE:-1}
+NPROC_PER_NODE=$(nvidia-smi --list-gpus | wc -l)  # Automatically detects available GPUs
 
 # DeepSpeed configuration
 deepspeed=./scripts/zero3.json
@@ -20,7 +21,7 @@ grad_accum_steps=4
 entry_file=qwenvl/train/train_qwen.py
 
 # Dataset configuration (replace with public dataset names)
-datasets=public_dataset1,public_dataset2
+datasets=my_dataset
 
 # Output configuration
 run_name="qwen3vl"
