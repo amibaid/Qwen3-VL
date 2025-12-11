@@ -26,13 +26,28 @@ VIDEOCHATGPT = {
     "data_path": "PATH_TO_VIDEOCHATGPT_DATA",
 }
 
-MY_DATASET = {
-    "annotation_path": "/content/10_annotations.json",
-    "data_path": "/content/clips",
+HD_EPIC_MINI = {
+    "annotation_path": "/home/aryan/ami/381V-final/381V-final-project/HD-EPIC/10_annotations.json",
+    "data_path": "/home/aryan/ami/381V-final/data/trimmed_clips_2",
+}
+HD_EPIC_BOTH_256 = {
+    "annotation_path": "/home/aryan/ami/381V-final/381V-final-project/HD-EPIC/p01_annotations_verified.json",
+    "data_path": "/home/aryan/ami/381V-final/data/gaze_crops_256",
+}
+HD_EPIC_OG_512 = {
+    "annotation_path": "/home/aryan/ami/381V-final/381V-final-project/HD-EPIC/p01_annotations_verified.json",
+    "data_path": "/home/aryan/ami/381V-final/data/original_crops_512",
+}
+HD_EPIC_GAZE_512 = {
+    "annotation_path": "/home/aryan/ami/381V-final/381V-final-project/HD-EPIC/p01_annotations_verified.json",
+    "data_path": "/home/aryan/ami/381V-final/data/gaze_only_512",
 }
 
 data_dict = {
-    "my_dataset": MY_DATASET,
+    "hd_epic_mini": HD_EPIC_MINI,
+    "hd_epic_both_256": HD_EPIC_BOTH_256,
+    "hd_epic_gaze_512": HD_EPIC_GAZE_512,
+    "hd_epic_og_512": HD_EPIC_OG_512,
     "cambrian_737k": CAMBRIAN_737K,
     "cambrian_737k_pack": CAMBRIAN_737K_PACK,
     "mp_doc": MP_DOC,

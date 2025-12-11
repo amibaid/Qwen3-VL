@@ -9,9 +9,11 @@ from typing import Dict, Optional, Sequence, List, Tuple, Any
 from collections.abc import Sequence
 from pathlib import Path
 
+
 import numpy as np
 import torch
 from torch.utils.data import Dataset
+from torch.utils.data import random_split
 
 import transformers
 
@@ -679,14 +681,38 @@ class FlattenedDataCollatorForSupervisedDataset(DataCollatorForSupervisedDataset
 def make_supervised_data_module(processor, data_args) -> Dict:
     """Make dataset and collator for supervised fine-tuning."""
     train_dataset = LazySupervisedDataset(processor, data_args=data_args)
+    # if data_args.data_flatten or data_args.data_packing:
+    #     data_collator = FlattenedDataCollatorForSupervisedDataset(processor.tokenizer)
+    #     return dict(
+    #         train_dataset=train_dataset, eval_dataset=None, data_collator=data_collator
+    #     )
+    # data_collator = DataCollatorForSupervisedDataset(processor.tokenizer)
+    # return dict(
+    #     train_dataset=train_dataset, eval_dataset=None, data_collator=data_collator
+    # )
+
+    
+    eval_dataset = None
+    if getattr(data_args, "eval_ratio", 0.0) > 0.0:
+        n_total = len(train_dataset)
+        n_eval = max(1, int(n_total * data_args.eval_ratio))
+        n_train = n_total - n_eval
+        # random_split returns Subset objects
+        train_dataset, eval_dataset = random_split(train_dataset, [n_train, n_eval])
+
     if data_args.data_flatten or data_args.data_packing:
         data_collator = FlattenedDataCollatorForSupervisedDataset(processor.tokenizer)
         return dict(
-            train_dataset=train_dataset, eval_dataset=None, data_collator=data_collator
+            train_dataset=train_dataset,
+            eval_dataset=eval_dataset,
+            data_collator=data_collator,
         )
+
     data_collator = DataCollatorForSupervisedDataset(processor.tokenizer)
     return dict(
-        train_dataset=train_dataset, eval_dataset=None, data_collator=data_collator
+        train_dataset=train_dataset,
+        eval_dataset=eval_dataset,
+        data_collator=data_collator,
     )
 
 

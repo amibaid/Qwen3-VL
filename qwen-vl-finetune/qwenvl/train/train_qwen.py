@@ -21,6 +21,7 @@ import torch
 import transformers
 import sys
 from pathlib import Path
+import torch.distributed as dist
 
 project_root = Path(__file__).parent.parent.parent
 sys.path.append(str(project_root))
@@ -47,7 +48,6 @@ local_rank = None
 def rank0_print(*args):
     if local_rank == 0:
         print(*args)
-
 
 def safe_save_model_for_hf_trainer(trainer: transformers.Trainer, output_dir: str):
     """Collects the state dict and dump to disk."""
@@ -87,7 +87,6 @@ def set_model(model_args, model):
         for n, p in model.language_model.named_parameters():
             p.requires_grad = False
         model.lm_head.requires_grad = False
-
 
 def train(attn_implementation="flash_attention_2"):
     global local_rank
@@ -179,7 +178,25 @@ def train(attn_implementation="flash_attention_2"):
     else:
         set_model(model_args, model)
 
-        if torch.distributed.get_rank() == 0:
+        is_main = (not dist.is_available() or
+            not dist.is_initialized() or
+            dist.get_rank() == 0)
+
+        trainable_params = []
+        frozen_params = []
+
+        for name, p in model.named_parameters():
+            if p.requires_grad:
+                trainable_params.append((name, p.numel()))
+            else:
+                frozen_params.append((name, p.numel()))
+
+        print(f"Trainable parameter count: {sum(n for _, n in trainable_params):,}")
+        print("Some trainable params:")
+        for name, n in trainable_params[:20]:
+            print("  ", name, n)
+
+        if is_main:
             model.visual.print_trainable_parameters()
             model.model.print_trainable_parameters()
     
