@@ -12,7 +12,7 @@ import time
 from tqdm.auto import tqdm
 from typing import Optional, List, Dict, Any, Set
 
-sys.path.append('/content/drive/MyDrive/381V-final-project/Qwen3-VL/qwen-vl-utils/src/')
+sys.path.append('/home/aryan/ami/381V-final/381V-final-project/Qwen3-VL/qwen-vl-utils/src/')
 
 from IPython.display import Markdown, display
 import numpy as np
@@ -25,7 +25,8 @@ import warnings
 warnings.filterwarnings("ignore", category=FutureWarning, module="transformers")
 
 
-model_path = "Qwen/Qwen3-VL-4B-Instruct"
+#model_path = "Qwen/Qwen3-VL-4B-Instruct"
+model_path = "/home/aryan/ami/381V-final/381V-final-project/Qwen3-VL/qwen-vl-finetune/hd_epic_og_512"
 processor = AutoProcessor.from_pretrained(model_path)
 
 model, output_loading_info = AutoModelForVision2Seq.from_pretrained(model_path,
@@ -187,13 +188,20 @@ def inference(video, prompt, max_new_tokens=2048, total_pixels=20480 * 32 * 32, 
         - When `video` is a frame list, `sample_fps` informs the model of the original sampling rate to help understand temporal density.
     """
 
+    # messages = [
+    #     {"role": "user", "content": [
+    #             {"video": video,
+    #             "total_pixels": total_pixels,
+    #             "min_pixels": min_pixels,
+    #             "max_frames": max_frames,
+    #             'sample_fps':sample_fps},
+    #             {"type": "text", "text": prompt},
+    #         ]
+    #     },
+    # ]
     messages = [
         {"role": "user", "content": [
-                {"video": video,
-                "total_pixels": total_pixels,
-                "min_pixels": min_pixels,
-                "max_frames": max_frames,
-                'sample_fps':sample_fps},
+                {"video": video},
                 {"type": "text", "text": prompt},
             ]
         },
@@ -209,6 +217,23 @@ def inference(video, prompt, max_new_tokens=2048, total_pixels=20480 * 32 * 32, 
     else:
         video_metadatas = None
     inputs = processor(text=[text], images=image_inputs, videos=video_inputs, video_metadata=video_metadatas, **video_kwargs, do_resize=False, return_tensors="pt")
+    
+    vision_tokens = None
+
+    # Videos (your use case)
+    if "video_grid_thw" in inputs:
+        # shape: (num_videos, 3) -> [T, H, W] per video
+        grid = inputs["video_grid_thw"]  # torch.LongTensor
+        # number of tokens = sum_i T_i * H_i * W_i
+        vision_tokens = int((grid[:, 0] * grid[:, 1] * grid[:, 2]).sum().item())
+
+    # Fallback for images-only setups (not strictly needed for you, but harmless)
+    elif "image_grid_thw" in inputs:
+        grid = inputs["image_grid_thw"]  # (num_images, 3)
+        vision_tokens = int((grid[:, 0] * grid[:, 1] * grid[:, 2]).sum().item())
+
+    print("video_grid_thw:", inputs.get("video_grid_thw"))
+    
     inputs = inputs.to('cuda')
 
     input_token_count = int(inputs["input_ids"].shape[1])
@@ -230,6 +255,7 @@ def inference(video, prompt, max_new_tokens=2048, total_pixels=20480 * 32 * 32, 
     stats = {
             "input_tokens": input_token_count,
             "output_tokens": output_token_count,
+            "vision_tokens": vision_tokens,
         }
     return output_text[0], stats
 
@@ -246,6 +272,7 @@ def evaluate_from_json(
     shard_id: int = 0,
     use_tqdm: bool = True,
     results_csv_path: Optional[str] = None,
+    max_per_type: Optional[int] = None,
   ) -> Dict[str, Any]:
     """
     Evaluate Qwen3-VL on a JSON dataset of video multiple-choice questions.
@@ -270,6 +297,23 @@ def evaluate_from_json(
         data = json.load(f)
 
     questions = data.get("questions", [])
+    # Optionally limit to a fixed number of examples per question *type*
+    # where the type is defined by the originating JSON source file
+    # (e.g. "fine_grained_action_localization.json").
+    if max_per_type is not None:
+        from collections import defaultdict
+
+        type_counts: Dict[str, int] = defaultdict(int)
+        limited_questions = []
+        for q in questions:
+            q_type = q.get("src_file", "")
+            if type_counts[q_type] >= max_per_type:
+                continue
+            type_counts[q_type] += 1
+            limited_questions.append(q)
+
+        questions = limited_questions
+
     video_id_filter = load_video_id_filter(csv_filter_path)
 
     if video_id_filter is not None:
@@ -319,6 +363,7 @@ def evaluate_from_json(
             "input_tokens",
             "output_tokens",
             "sample_fps_eff",
+            "vision_tokens",
         ]
         csv_writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
         if not file_exists:
@@ -413,6 +458,7 @@ def evaluate_from_json(
             "input_tokens": infer_stats["input_tokens"],
             "output_tokens": infer_stats["output_tokens"],
             "sample_fps_eff": effective_sample_fps,
+            "vision_tokens": infer_stats["vision_tokens"],
         }
 
         results.append({
@@ -453,6 +499,7 @@ def main(args):
         num_shards=args.num_shards,
         shard_id=args.shard_id,
         results_csv_path=args.results_csv,
+        max_per_type=args.max_per_type,
     )
 
 if __name__ == "__main__":
@@ -518,6 +565,12 @@ if __name__ == "__main__":
         type=int,
         default=0,
         help="Shard index for this process (0-based)",
+    )
+    parser.add_argument(
+        "--max-per-type",
+        type=int,
+        default=None,
+        help="Maximum number of questions to evaluate per question type (src_file).",
     )
 
     args = parser.parse_args()
